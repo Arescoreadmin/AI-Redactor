@@ -1,0 +1,42 @@
+name: smoke
+
+on:
+  workflow_dispatch:        # allow manual runs
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '0 9 * * *'     # daily 09:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # Python is used by scripts/smoke.sh to parse JSON (python or python3).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Prepare env file
+        run: cp infra/.env.example infra/.env
+
+      - name: Run smoke
+        env:
+          AUTO_UP: "1"           # let the script start docker compose
+          HEALTH_TIMEOUT: "180"  # give CI a bit more time
+          TIMEOUT: "180"
+        run: bash ./scripts/smoke.sh
+
+      - name: Dump compose logs on failure
+        if: failure()
+        run: |
+          docker compose --env-file infra/.env -f infra/docker-compose.yml ps
+          docker compose --env-file infra/.env -f infra/docker-compose.yml logs --no-color --tail=200
