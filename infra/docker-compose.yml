@@ -1,0 +1,96 @@
+services:
+  caddy:
+    image: caddy:2
+    ports: ["80:80"]
+    volumes:
+      - ../docker/caddy/Caddyfile:/etc/caddy/Caddyfile
+    depends_on: [api_gateway]
+    restart: unless-stopped
+
+  api_gateway:
+    build: ../services/api_gateway
+    environment:
+      POSTGRES_DSN: ${POSTGRES_DSN}
+      NATS_URL: ${NATS_URL}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      JWT_ISSUER: ${JWT_ISSUER}
+      JWT_AUDIENCE: ${JWT_AUDIENCE}
+      JWT_SIGNING_KEY: ${JWT_SIGNING_KEY}
+    depends_on:
+      nats: { condition: service_started }
+      postgres: { condition: service_healthy }
+    ports: ["8080:8080"]
+    healthcheck: { test: ["CMD","curl","-f","http://localhost:8080/healthz"], interval: 10s, timeout: 2s, retries: 10 }
+    restart: unless-stopped
+
+  orchestrator:
+    build: ../services/orchestrator
+    environment:
+      POSTGRES_DSN: ${POSTGRES_DSN}
+      NATS_URL: ${NATS_URL}
+    depends_on: [nats, postgres]
+    restart: unless-stopped
+
+  worker_doc:
+    build: ../services/worker_doc
+    environment:
+      NATS_URL: ${NATS_URL}
+      PII_RULESET: ${PII_RULESET}
+    depends_on: [nats]
+    restart: unless-stopped
+
+  worker_audio:
+    build: ../services/worker_audio
+    environment:
+      NATS_URL: ${NATS_URL}
+      ASR_MODEL: ${ASR_MODEL}
+      PII_RULESET: ${PII_RULESET}
+    depends_on: [nats]
+    restart: unless-stopped
+
+  worker_video:
+    build: ../services/worker_video
+    environment:
+      NATS_URL: ${NATS_URL}
+      FACE_MODEL: ${FACE_MODEL}
+      OCR_ENGINE: ${OCR_ENGINE}
+      ASR_MODEL: ${ASR_MODEL}
+    depends_on: [nats]
+    restart: unless-stopped
+
+  worker_packager:
+    build: ../services/worker_packager
+    environment:
+      NATS_URL: ${NATS_URL}
+    depends_on: [nats]
+    restart: unless-stopped
+
+  audit_log:
+    build: ../services/audit_log
+    environment:
+      POSTGRES_DSN: ${POSTGRES_DSN}
+    depends_on: [postgres]
+    restart: unless-stopped
+
+  nats:
+    image: nats:2
+    command: ["-js","-sd","/var/lib/nats"]
+    volumes: ["nats:/var/lib/nats"]
+
+  postgres:
+    image: postgres:15
+    environment: { POSTGRES_DB: redactor, POSTGRES_PASSWORD: postgres, POSTGRES_USER: postgres }
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck: { test: ["CMD-SHELL","pg_isready -U postgres"], interval: 5s, timeout: 2s, retries: 20 }
+
+  minio:
+    image: minio/minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment: { MINIO_ROOT_USER: minio, MINIO_ROOT_PASSWORD: minio123 }
+    volumes: ["minio:/data"]
+    ports: ["9000:9000","9001:9001"]
+
+volumes:
+  pgdata: {}
+  minio: {}
+  nats: {}

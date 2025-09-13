@@ -1,0 +1,24 @@
+# env & secrets
+infra/.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Node
+services/review_ui/node_modules/
+services/review_ui/.vite/
+services/review_ui/dist/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Editor junk
+.vscode/
+.idea/

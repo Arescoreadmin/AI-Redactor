@@ -1,0 +1,9 @@
+:80 {
+  encode gzip
+  handle_path /api/* {
+    reverse_proxy api_gateway:8080
+  }
+  handle {
+    respond "AI Redaction Suite MVP: see /api" 200
+  }
+}
