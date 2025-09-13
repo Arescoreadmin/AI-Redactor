@@ -1,3 +1,5 @@
+[![smoke](https://github.com/Arescoreadmin/AI-Redactor/actions/workflows/smoke.yml/badge.svg)](https://github.com/Arescoreadmin/AI-Redactor/actions/workflows/smoke.yml)
+
 cat >> README.md <<'MD'
 ## Quickstart (Dev)
 
