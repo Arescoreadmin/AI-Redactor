@@ -1,53 +1,165 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# smoke.sh — create a job, approve it, and wait until it finishes.
+# Works in Git Bash / macOS / Linux. No external deps required (jq optional).
 
-TIMEOUT="${TIMEOUT:-60}"   # seconds
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+# -------------------------
+# Config (override via env)
+# -------------------------
+BASE_URL="${BASE_URL:-http://localhost:8080}"
+HEALTH_ENDPOINT="${HEALTH_ENDPOINT:-/healthz}"
+ORG_ID="${ORG_ID:-00000000-0000-0000-0000-000000000001}"
+JOB_TYPE="${JOB_TYPE:-doc}"
+
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-60}"   # seconds to wait for health
+HEALTH_SLEEP="${HEALTH_SLEEP:-1}"
+TIMEOUT="${TIMEOUT:-60}"                 # seconds to wait for job completion
 SLEEP="${SLEEP:-1}"
 
-# wait for API
-until curl -s http://localhost:8080/healthz | grep -q '"status":"ok"'; do
-  printf .
-  sleep 1
+# DEBUG=1 ./scripts/smoke.sh to see commands
+[[ "${DEBUG:-0}" == "1" ]] && set -x
+
+# -------------------------
+# Utils
+# -------------------------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+json_get() {
+  # json_get "<json-string>" key
+  local _json="$1" _key="$2"
+  if have jq; then
+    printf '%s' "$(_safe_echo "$_json" | jq -r --arg k "$_key" '.[$k] // empty')" 2>/dev/null || true
+  elif have python3 || have python; then
+    local _py="import sys, json
+d=json.load(sys.stdin)
+print(d.get('$(_safe_py_str "$_key")',''))"
+    _safe_echo "$_json" | (python3 - <<PY || python - <<PY || true)
+$_py
+PY
+  else
+    # very last-resort (not perfect, but fine for flat keys)
+    printf '%s' "$_json" | sed -n "s/.*\"$_key\":\"\([^\"]*\)\".*/\1/p"
+  fi
+}
+
+_safe_echo() { printf '%s' "$1"; }
+_safe_py_str() { printf "%s" "$1" | sed "s/'/\\\\'/g"; }
+
+is_uuid() {
+  [[ "$1" =~ ^[0-9a-fA-F-]{32,36}$ ]]
+}
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+diag() {
+  echo
+  echo "---- Diagnostics ----"
+  echo "health URL: ${BASE_URL}${HEALTH_ENDPOINT}"
+  echo "compose status:"
+  if [[ -x ./scripts/dc.sh ]]; then
+    ./scripts/dc.sh ps || true
+    echo "api_gateway logs (last 80):"
+    ./scripts/dc.sh logs -n 80 api_gateway || true
+    echo "orchestrator logs (last 80):"
+    ./scripts/dc.sh logs -n 80 orchestrator || true
+  elif have docker; then
+    docker compose ps || true
+    docker compose logs --tail 80 api_gateway orchestrator || true
+  fi
+  echo "---------------------"
+}
+
+trap 'echo "Smoke failed at line $LINENO"; diag' ERR
+
+curl_json() {
+  # curl_json METHOD PATH [BODY]
+  local _method="$1" _path="$2" _body="${3:-}"
+  local _url="${BASE_URL}${_path}"
+  if [[ -n "$_body" ]]; then
+    curl -sS -f -X "$_method" "$_url" \
+      -H 'content-type: application/json' \
+      --data "$_body"
+  else
+    curl -sS -f -X "$_method" "$_url"
+  fi
+}
+
+# -------------------------
+# 1) Wait for API health
+# -------------------------
+echo "Waiting for API health at ${BASE_URL}${HEALTH_ENDPOINT} …"
+start=$(date +%s)
+while true; do
+  out="$(curl -s "${BASE_URL}${HEALTH_ENDPOINT}" || true)"
+  if [[ "$out" == *'"status":"ok"'* ]]; then
+    echo "API is healthy."
+    break
+  fi
+  now=$(date +%s)
+  (( now - start >= HEALTH_TIMEOUT )) && {
+    echo "Health check did not pass within ${HEALTH_TIMEOUT}s."
+    echo "Raw health response:"; echo "----"; printf '%s\n' "$out"; echo "----"
+    diag
+    exit 1
+  }
+  printf '.'
+  sleep "$HEALTH_SLEEP"
 done
-echo
 
-# create job (capture raw response)
-resp="$(curl -sS -X POST http://localhost:8080/v1/jobs \
-  -H 'content-type: application/json' \
-  -d '{"type":"doc","org_id":"00000000-0000-0000-0000-000000000001"}')"
+# -------------------------
+# 2) Create job
+# -------------------------
+echo "Creating ${JOB_TYPE} job…"
+create_body=$(curl_json POST "/v1/jobs" \
+  "{\"type\":\"${JOB_TYPE}\",\"org_id\":\"${ORG_ID}\"}" || true)
 
-# fail fast if the response doesn't look like JSON
-if ! printf '%s' "$resp" | grep -q '^{'; then
-  echo "Unexpected response creating job:"
-  echo "----"
-  printf '%s\n' "$resp"
-  echo "----"
+# Ensure JSON-like
+[[ "$create_body" == \{* ]] || {
+  echo "Unexpected response when creating job:"
+  echo "----"; printf '%s\n' "$create_body"; echo "----"
+  diag
   exit 1
-fi
+}
 
-# parse id without jq (portable), fall back to printing resp on failure
-jid="$(printf '%s' "$resp" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')"
-if ! printf '%s' "$jid" | grep -Eq '^[0-9a-fA-F-]{32,36}$'; then
-  echo "Could not extract job id from response:"
-  echo "----"
-  printf '%s\n' "$resp"
-  echo "----"
-  exit 1
-fi
+jid="$(json_get "$create_body" id)"
+is_uuid "$jid" || die "Could not extract job id from response: $create_body"
 echo "jid=$jid"
 
-# approve
-curl -sfS -X POST "http://localhost:8080/v1/review/$jid/approve" >/dev/null
+# -------------------------
+# 3) Approve job
+# -------------------------
+echo "Approving job…"
+curl_json POST "/v1/review/${jid}/approve" >/dev/null
 
-# poll until completed (or timeout)
+# -------------------------
+# 4) Poll until completed
+# -------------------------
+echo "Waiting for job completion (timeout=${TIMEOUT}s)…"
 start=$(date +%s)
-while :; do
-  body="$(curl -sfS "http://localhost:8080/v1/jobs/$jid")"
-  status="$(printf '%s' "$body" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')"
-  echo "status=$status"
-  [ "$status" = "completed" ] && { echo "$body"; break; }
+while true; do
+  job_body="$(curl_json GET "/v1/jobs/${jid}")"
+  status="$(json_get "$job_body" status)"
+  printf 'status=%s\r' "$status"
+
+  if [[ "$status" == "completed" ]]; then
+    echo
+    echo "Final job object:"
+    printf '%s\n' "$job_body"
+    echo "✅ Smoke succeeded."
+    exit 0
+  fi
 
   now=$(date +%s)
-  (( now - start > TIMEOUT )) && { echo "timeout waiting for completion"; exit 1; }
+  (( now - start >= TIMEOUT )) && {
+    echo
+    echo "Timed out waiting for job to complete."
+    echo "Last job object:"
+    printf '%s\n' "$job_body"
+    diag
+    exit 1
+  }
+
   sleep "$SLEEP"
 done
