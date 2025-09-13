@@ -21,3 +21,8 @@ curl -s http://localhost:8080/v1/jobs/$JOB_ID
 # down
 ./scripts/dc.sh down            # keep data
 # ./scripts/dc.sh down -v       # wipe data
+
+printf '\n[![smoke](https://github.com/Arescoreadmin/AI-Redactor/actions/workflows/smoke.yml/badge.svg)](https://github.com/Arescoreadmin/AI-Redactor/actions/workflows/smoke.yml)\n' >> README.md
+git add README.md
+git commit -m "docs: add CI smoke badge"
+git push
