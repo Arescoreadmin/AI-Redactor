@@ -1,176 +1,190 @@
 #!/usr/bin/env bash
-# smoke.sh — create a job, approve it, and wait until it finishes.
-# Works in Git Bash / macOS / Linux. jq optional.
+# Smoke test for AI-Redactor stack
+# - Waits for API health
+# - Creates a job, approves it, waits for completion
+# Env knobs:
+#   API_URL         (default: http://localhost:8080)
+#   HEALTH_TIMEOUT  seconds to wait for health (default: 60)
+#   TIMEOUT         seconds to wait for job completion (default: 90)
+#   JOB_TYPE        job type: doc|audio|video (default: doc)
+#   ORG_ID          org UUID (default: 00000000-0000-0000-0000-000000000001)
+#   AUTO_UP         if set to 1, bring containers up automatically
+#   COMPOSE_FILE    override compose file (default: infra/docker-compose.yml)
+#   ENV_FILE        override env file      (default: infra/.env)
 
 set -Eeuo pipefail
-IFS=$'\n\t'
 
-# -------------------------
-# Config (override via env)
-# -------------------------
-BASE_URL="${BASE_URL:-http://localhost:8080}"
-HEALTH_ENDPOINT="${HEALTH_ENDPOINT:-/healthz}"
-ORG_ID="${ORG_ID:-00000000-0000-0000-0000-000000000001}"
+API_URL="${API_URL:-http://localhost:8080}"
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-60}"
+TIMEOUT="${TIMEOUT:-90}"
 JOB_TYPE="${JOB_TYPE:-doc}"
+ORG_ID="${ORG_ID:-00000000-0000-0000-0000-000000000001}"
+AUTO_UP="${AUTO_UP:-0}"
+COMPOSE_FILE="${COMPOSE_FILE:-infra/docker-compose.yml}"
+ENV_FILE="${ENV_FILE:-infra/.env}"
 
-HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-60}"   # seconds to wait for health
-HEALTH_SLEEP="${HEALTH_SLEEP:-1}"
-TIMEOUT="${TIMEOUT:-60}"                 # seconds to wait for job completion
-SLEEP="${SLEEP:-1}"
+# --- helpers ---------------------------------------------------------------
 
-# Auto-start stack if requested
-if [[ "${AUTO_UP:-0}" == "1" && -x ./scripts/dc.sh ]]; then
-  echo "AUTO_UP=1 → bringing up containers…"
-  ./scripts/dc.sh up -d
-fi
+err() { printf "\n\033[31mERROR:\033[0m %s\n" "$*" >&2; }
 
-
-# DEBUG=1 ./scripts/smoke.sh to see commands
-[[ "${DEBUG:-0}" == "1" ]] && set -x
-
-# -------------------------
-# Utils
-# -------------------------
-have() { command -v "$1" >/dev/null 2>&1; }
-die() { echo "ERROR: $*" >&2; exit 1; }
-_safe_echo() { printf '%s' "$1"; }
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 json_get() {
-  # json_get "<json-string>" key
-  local _json="$1" _key="$2"
-  if have jq; then
-    printf '%s' "$(_safe_echo "$_json" | jq -r --arg k "$_key" '.[$k] // empty')" 2>/dev/null || true
-    return
-  fi
-
-  local PYEXE=""
-  if have python3; then PYEXE=python3
-  elif have python; then PYEXE=python
-  fi
-
-  if [[ -n "$PYEXE" ]]; then
-    KEY="$_key" _safe_echo "$_json" | "$PYEXE" - <<'PY'
-import sys, json, os
-key = os.environ.get("KEY")
-try:
-    d = json.load(sys.stdin)
-    print(d.get(key, ""))
-except Exception:
-    # fall through for shell fallback
-    pass
-PY
-    return
-  fi
-
-  # very last resort (flat keys only)
-  printf '%s' "$_json" | sed -n "s/.*\"$_key\":\"\([^\"]*\)\".*/\1/p"
+  # Reads JSON from stdin and prints a top-level field value ($1)
+  # Requires Python 3 (present in your setup)
+  python -c "import sys,json;print(json.load(sys.stdin).get('$1',''))" 2>/dev/null
 }
 
-diag() {
-  echo
-  echo "---- Diagnostics ----"
-  echo "health URL: ${BASE_URL}${HEALTH_ENDPOINT}"
+compose() {
   if [[ -x ./scripts/dc.sh ]]; then
-    ./scripts/dc.sh ps || true
-    echo "api_gateway logs (last 80):"
-    ./scripts/dc.sh logs -n 80 api_gateway || true
-    echo "orchestrator logs (last 80):"
-    ./scripts/dc.sh logs -n 80 orchestrator || true
-  elif have docker; then
-    docker compose ps || true
-    docker compose logs --tail 80 api_gateway orchestrator || true
+    ./scripts/dc.sh "$@"
+  elif has_cmd docker && has_cmd docker compose; then
+    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@"
+  else
+    err "docker compose not available"
+    return 1
   fi
+}
+
+log_tail() {
+  local svc="$1" lines="${2:-80}"
+  if [[ -x ./scripts/dc.sh ]]; then
+    ./scripts/dc.sh logs -n "$lines" "$svc" || true
+  elif has_cmd docker && has_cmd docker compose; then
+    docker compose -f "$COMPOSE_FILE" logs -n "$lines" "$svc" || true
+  fi
+}
+
+diagnostics() {
+  echo "---- Diagnostics ----"
+  echo "health URL: $API_URL/healthz"
+  if has_cmd docker && has_cmd docker compose; then
+    docker compose -f "$COMPOSE_FILE" ps || true
+  elif [[ -x ./scripts/dc.sh ]]; then
+    ./scripts/dc.sh ps || true
+  fi
+  echo "api_gateway logs (last 80):"
+  log_tail api_gateway 80
+  echo "orchestrator logs (last 80):"
+  log_tail orchestrator 80
   echo "---------------------"
 }
 
-trap 'echo "Smoke failed at line $LINENO"; diag' ERR
-
-curl_json() {
-  # curl_json METHOD PATH [BODY]
-  local _method="$1" _path="$2" _body="${3:-}"
-  local _url="${BASE_URL}${_path}"
-  if [[ -n "$_body" ]]; then
-    curl -sS -f -X "$_method" "$_url" \
-      -H 'content-type: application/json' \
-      --data "$_body"
+print_status_line() {
+  # Single-line status with fallback if tput isn't usable
+  local s="$1"
+  if has_cmd tput && tput el >/dev/null 2>&1; then
+    printf "\rstatus=%s" "$s"
+    tput el
   else
-    curl -sS -f -X "$_method" "$_url"
+    printf "\rstatus=%s\033[K" "$s"
   fi
 }
 
-# -------------------------
-# 1) Wait for API health
-# -------------------------
-echo "Waiting for API health at ${BASE_URL}${HEALTH_ENDPOINT} …"
-start=$(date +%s)
-while true; do
-  out="$(curl -s "${BASE_URL}${HEALTH_ENDPOINT}" || true)"
-  if [[ "$out" == *'"status":"ok"'* ]]; then
+# --- optional auto up ------------------------------------------------------
+
+if [[ "$AUTO_UP" == "1" ]]; then
+  echo "AUTO_UP=1 → bringing up containers…"
+  compose up -d
+fi
+
+# --- wait for health -------------------------------------------------------
+
+echo "Waiting for API health at $API_URL/healthz …"
+start="$(date +%s)"
+while :; do
+  # Expect 200 and {"status":"ok"}
+  resp="$(curl -sS -w $'\n%{http_code}' "$API_URL/healthz" || true)"
+  code="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
+  if [[ "$code" == "200" ]] && echo "$body" | grep -q '"status":"ok"'; then
     echo "API is healthy."
     break
   fi
-  now=$(date +%s)
+  now="$(date +%s)"
   (( now - start >= HEALTH_TIMEOUT )) && {
     echo "Health check did not pass within ${HEALTH_TIMEOUT}s."
-    echo "Raw health response:"; echo "----"; printf '%s\n' "$out"; echo "----"
-    diag
+    echo "Raw health response:"
+    echo "----"; echo "$body"; echo "----"
+    diagnostics
     exit 1
   }
-  printf '.'
-  sleep "$HEALTH_SLEEP"
+  printf .
+  sleep 1
 done
 
-# -------------------------
-# 2) Create job
-# -------------------------
-echo "Creating ${JOB_TYPE} job…"
-create_body=$(curl_json POST "/v1/jobs" \
-  "{\"type\":\"${JOB_TYPE}\",\"org_id\":\"${ORG_ID}\"}" || true)
+# --- create job ------------------------------------------------------------
 
-[[ "$create_body" == \{* ]] || {
-  echo "Unexpected response when creating job:"
-  echo "----"; printf '%s\n' "$create_body"; echo "----"
-  diag
+echo "Creating $JOB_TYPE job…"
+resp="$(curl -sS -w $'\n%{http_code}' -X POST "$API_URL/v1/jobs" \
+  -H 'content-type: application/json' \
+  -d "{\"type\":\"$JOB_TYPE\",\"org_id\":\"$ORG_ID\"}" || true)"
+code="${resp##*$'\n'}"
+body="${resp%$'\n'*}"
+
+if [[ "$code" != "200" ]]; then
+  err "Job creation failed (HTTP $code). Body:"
+  echo "$body"
+  diagnostics
   exit 1
-}
+fi
 
-jid="$(json_get "$create_body" id)"
-[[ -n "$jid" && "$jid" =~ ^[0-9a-fA-F-]{32,36}$ ]] || die "Could not extract job id from response: $create_body"
+jid="$(printf "%s" "$body" | json_get id)"
+if [[ -z "$jid" ]]; then
+  err "Could not extract job id from response:"
+  echo "$body"
+  diagnostics
+  exit 1
+fi
+
 echo "jid=$jid"
 
-# -------------------------
-# 3) Approve job
-# -------------------------
+# --- approve ---------------------------------------------------------------
+
 echo "Approving job…"
-curl_json POST "/v1/review/${jid}/approve" >/dev/null
+curl -sfS -X POST "$API_URL/v1/review/$jid/approve" >/dev/null
 
-# -------------------------
-# 4) Poll until completed
-# -------------------------
+# --- poll completion -------------------------------------------------------
+
 echo "Waiting for job completion (timeout=${TIMEOUT}s)…"
-start=$(date +%s)
-while true; do
-  job_body="$(curl_json GET "/v1/jobs/${jid}")"
-  status="$(json_get "$job_body" status)"
-  printf 'status=%s\r' "$status"
+start="$(date +%s)"
+state="unknown"  # avoid set -u before first poll
 
-  if [[ "$status" == "completed" ]]; then
-    echo
-    echo "Final job object:"
-    printf '%s\n' "$job_body"
-    echo "✅ Smoke succeeded."
-    exit 0
+while :; do
+  resp="$(curl -sS -w $'\n%{http_code}' "$API_URL/v1/jobs/$jid" || true)"
+  code="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
+
+  if [[ "$code" == "200" ]]; then
+    # Try to parse; if parse fails, keep previous state
+    parsed="$(printf "%s" "$body" | json_get status || true)"
+    [[ -n "$parsed" ]] && state="$parsed"
+  else
+    state="unknown"
   fi
 
-  now=$(date +%s)
+  print_status_line "$state"
+
+  if [[ "$state" == "completed" ]]; then
+    echo
+    break
+  fi
+
+  now="$(date +%s)"
   (( now - start >= TIMEOUT )) && {
     echo
-    echo "Timed out waiting for job to complete."
+    err "Timed out after ${TIMEOUT}s waiting for completion."
     echo "Last job object:"
-    printf '%s\n' "$job_body"
-    diag
+    echo "$body"
+    diagnostics
     exit 1
   }
-
-  sleep "$SLEEP"
+  sleep 1
 done
+
+# --- final readout ---------------------------------------------------------
+
+echo "Final job object:"
+curl -sfS "$API_URL/v1/jobs/$jid"
+echo
+echo "✅ Smoke succeeded."
