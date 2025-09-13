@@ -1,0 +1,17 @@
+name: release-zip
+on:
+  push:
+    tags: [ 'v*' ]
+jobs:
+  zip:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Archive repo at tag
+        run: |
+          git archive -o AI-Redactor-quickstart-${GITHUB_REF_NAME}.zip ${GITHUB_REF_NAME}
+      - name: Upload asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: AI-Redactor-quickstart-${{ github.ref_name }}.zip
