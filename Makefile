@@ -3,7 +3,7 @@ SHELL := bash
 .SHELLFLAGS := -eu -o pipefail -c
 
 ROOT := $(CURDIR)
-DC := docker compose --env-file infra/.env -f infra/docker-compose.yml
+DC   := docker compose --env-file $(ROOT)/infra/.env -f $(ROOT)/infra/docker-compose.yml
 
 JOBS ?= doc audio video
 JOB  ?= doc
@@ -11,34 +11,42 @@ JOB  ?= doc
 HEALTH_TIMEOUT ?= 120
 TIMEOUT        ?= 120
 AUTO_UP        ?= 1
+TAIL          ?= 200
+SVC           ?=
 
-.PHONY: smoke smoke-% smoke-all up down down-v ps logs
+# default goal shows a help menu
+.DEFAULT_GOAL := help
 
-smoke:
+.PHONY: help smoke smoke-% smoke-all up down down-v ps logs
+
+help: ## Show available targets
+	@awk 'BEGIN{FS=":.*##"; printf "\nTargets:\n"} /^[a-zA-Z0-9_.-]+:.*##/{printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+
+smoke: ## Run smoke for JOB (default: doc)
 	@echo "==> smoke $(JOB)"
 	AUTO_UP=$(AUTO_UP) HEALTH_TIMEOUT=$(HEALTH_TIMEOUT) TIMEOUT=$(TIMEOUT) JOB_TYPE=$(JOB) bash ./scripts/smoke.sh
 
-smoke-%:
+smoke-%: ## Run smoke for a specific job type (doc|audio|video)
 	@echo "==> smoke $*"
 	AUTO_UP=$(AUTO_UP) HEALTH_TIMEOUT=$(HEALTH_TIMEOUT) TIMEOUT=$(TIMEOUT) JOB_TYPE=$* bash ./scripts/smoke.sh
 
-smoke-all:
+smoke-all: ## Run smoke for doc, audio, video
 	@rc=0; for j in $(JOBS); do \
 	  echo ""; echo "===== $$j ====="; \
 	  AUTO_UP=$(AUTO_UP) HEALTH_TIMEOUT=$(HEALTH_TIMEOUT) TIMEOUT=$(TIMEOUT) JOB_TYPE=$$j bash ./scripts/smoke.sh || rc=1; \
 	done; exit $$rc
 
-up:
+up: ## docker compose up -d
 	$(DC) up -d
 
-down:
+down: ## docker compose down
 	$(DC) down
 
-down-v:
+down-v: ## docker compose down -v (wipe volumes)
 	$(DC) down -v
 
-ps:
+ps: ## docker compose ps
 	$(DC) ps
 
-logs:
-	$(DC) logs --tail=${TAIL:-200} $(SVC)
+logs: ## docker compose logs (env: SVC=api_gateway, TAIL=200)
+	$(DC) logs --tail=$(TAIL) $(SVC)
