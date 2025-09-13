@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # smoke.sh — create a job, approve it, and wait until it finishes.
-# Works in Git Bash / macOS / Linux. No external deps required (jq optional).
+# Works in Git Bash / macOS / Linux. jq optional.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -18,6 +18,13 @@ HEALTH_SLEEP="${HEALTH_SLEEP:-1}"
 TIMEOUT="${TIMEOUT:-60}"                 # seconds to wait for job completion
 SLEEP="${SLEEP:-1}"
 
+# Auto-start stack if requested
+if [[ "${AUTO_UP:-0}" == "1" && -x ./scripts/dc.sh ]]; then
+  echo "AUTO_UP=1 → bringing up containers…"
+  ./scripts/dc.sh up -d
+fi
+
+
 # DEBUG=1 ./scripts/smoke.sh to see commands
 [[ "${DEBUG:-0}" == "1" ]] && set -x
 
@@ -25,39 +32,44 @@ SLEEP="${SLEEP:-1}"
 # Utils
 # -------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
+die() { echo "ERROR: $*" >&2; exit 1; }
+_safe_echo() { printf '%s' "$1"; }
 
 json_get() {
   # json_get "<json-string>" key
   local _json="$1" _key="$2"
   if have jq; then
     printf '%s' "$(_safe_echo "$_json" | jq -r --arg k "$_key" '.[$k] // empty')" 2>/dev/null || true
-  elif have python3 || have python; then
-    local _py="import sys, json
-d=json.load(sys.stdin)
-print(d.get('$(_safe_py_str "$_key")',''))"
-    _safe_echo "$_json" | (python3 - <<PY || python - <<PY || true)
-$_py
-PY
-  else
-    # very last-resort (not perfect, but fine for flat keys)
-    printf '%s' "$_json" | sed -n "s/.*\"$_key\":\"\([^\"]*\)\".*/\1/p"
+    return
   fi
+
+  local PYEXE=""
+  if have python3; then PYEXE=python3
+  elif have python; then PYEXE=python
+  fi
+
+  if [[ -n "$PYEXE" ]]; then
+    KEY="$_key" _safe_echo "$_json" | "$PYEXE" - <<'PY'
+import sys, json, os
+key = os.environ.get("KEY")
+try:
+    d = json.load(sys.stdin)
+    print(d.get(key, ""))
+except Exception:
+    # fall through for shell fallback
+    pass
+PY
+    return
+  fi
+
+  # very last resort (flat keys only)
+  printf '%s' "$_json" | sed -n "s/.*\"$_key\":\"\([^\"]*\)\".*/\1/p"
 }
-
-_safe_echo() { printf '%s' "$1"; }
-_safe_py_str() { printf "%s" "$1" | sed "s/'/\\\\'/g"; }
-
-is_uuid() {
-  [[ "$1" =~ ^[0-9a-fA-F-]{32,36}$ ]]
-}
-
-die() { echo "ERROR: $*" >&2; exit 1; }
 
 diag() {
   echo
   echo "---- Diagnostics ----"
   echo "health URL: ${BASE_URL}${HEALTH_ENDPOINT}"
-  echo "compose status:"
   if [[ -x ./scripts/dc.sh ]]; then
     ./scripts/dc.sh ps || true
     echo "api_gateway logs (last 80):"
@@ -115,7 +127,6 @@ echo "Creating ${JOB_TYPE} job…"
 create_body=$(curl_json POST "/v1/jobs" \
   "{\"type\":\"${JOB_TYPE}\",\"org_id\":\"${ORG_ID}\"}" || true)
 
-# Ensure JSON-like
 [[ "$create_body" == \{* ]] || {
   echo "Unexpected response when creating job:"
   echo "----"; printf '%s\n' "$create_body"; echo "----"
@@ -124,7 +135,7 @@ create_body=$(curl_json POST "/v1/jobs" \
 }
 
 jid="$(json_get "$create_body" id)"
-is_uuid "$jid" || die "Could not extract job id from response: $create_body"
+[[ -n "$jid" && "$jid" =~ ^[0-9a-fA-F-]{32,36}$ ]] || die "Could not extract job id from response: $create_body"
 echo "jid=$jid"
 
 # -------------------------
